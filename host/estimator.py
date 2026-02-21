@@ -57,6 +57,13 @@ G_MPS2 = 9.80665          # m/s^2
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
+# Velocity magnitude clamp -- no human movement exceeds this (m/s)
+_VZ_CLAMP = 5.0
+
+# Low-acceleration threshold for soft velocity decay (m/s^2)
+# When |az| is below this, velocity decays even if ZUPT says "moving"
+_LOW_ACCEL_THRESH = 0.3
+
 # -- State indices -------------------------------------------------------------
 _SQ  = slice(0, 4)     # quaternion
 _SBG = slice(4, 7)     # gyro bias
@@ -425,32 +432,52 @@ class IMUEstimator:
         - Continuous tempo sets
         - All exercise types (squat, bench, deadlift, rows, etc.)
 
-        Drift control:
-        - At rest (ZUPT): exponential decay toward zero
-        - During motion: velocity bias subtracted
+        Drift control (multi-layer):
+        1. ZUPT rest: aggressive exponential decay + bias learning
+        2. Low-accel soft decay: decays velocity when bar isn't
+           accelerating, even if ZUPT hasn't triggered yet
+        3. Velocity clamp: hard limit at ±5 m/s (physical sanity)
+        4. Full bias subtraction during integration
 
         Rep detection:
         - Smooth displacement with moving-average window
         - Detect peaks (+1) and valleys (-1) with hysteresis
         - A full rep = 3 consecutive alternating reversals forming a
           concentric + eccentric cycle (or vice-versa)
+        - Reversals are CONSUMED after rep detection to prevent
+          double-counting
         """
         rep_metrics = None
 
         # -- Drift control --
         if self.is_stationary:
+            # Hard ZUPT: aggressive decay
             self._rest_samples += 1
             decay = math.exp(-self.rest_drift_rate * dt)
             self._vz *= decay
+            # Learn velocity bias from rest (slow EMA)
             alpha = min(0.02, 1.0 / max(self._rest_samples, 1))
-            self._vz_bias = (1.0 - alpha) * self._vz_bias + alpha * self._vz
+            self._vz_bias = (1.0 - alpha) * self._vz_bias + alpha * az
+            # Snap to zero once very small
             if abs(self._vz) < 0.002:
                 self._vz = 0.0
+            # Decay displacement drift after sustained rest
             if self._rest_samples > 100:
                 self._dz *= decay
         else:
             self._rest_samples = 0
-            self._vz += (az - self._vz_bias * 0.5) * dt
+            # Integrate with full bias subtraction
+            self._vz += (az - self._vz_bias) * dt
+
+        # Soft decay: when acceleration is very low (bar not accelerating),
+        # apply mild velocity decay even if ZUPT hasn't triggered.
+        # This prevents runaway drift from tiny gravity-removal errors.
+        if not self.is_stationary and abs(az) < _LOW_ACCEL_THRESH:
+            soft_decay = math.exp(-1.0 * dt)  # mild 1/s decay
+            self._vz *= soft_decay
+
+        # Hard velocity clamp -- no human exercise exceeds ±5 m/s
+        self._vz = max(-_VZ_CLAMP, min(_VZ_CLAMP, self._vz))
 
         self._dz += self._vz * dt
 
@@ -523,6 +550,10 @@ class IMUEstimator:
             # r0 and r2 should be same type, r1 opposite
             if r0[1] == r2[1] and r0[1] != r1[1]:
                 rep_metrics = self._process_full_rep(r0, r1, r2)
+                # CONSUME used reversals -- keep only r2 as seed for
+                # the next rep.  Without this, the next reversal r3
+                # would form (r1,r2,r3) and double-count.
+                self._reversals = [r2]
 
         # -- Memory management: trim old buffers --
         max_buf = 5000

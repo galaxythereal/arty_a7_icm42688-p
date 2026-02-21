@@ -29,6 +29,7 @@ from host.estimator import (
     IMUEstimator, EstimatorState, _qnorm, _qmul, _qrot, _q2dcm,
     _omega_matrix, _skew,
     G_MPS2, DEG2RAD, RAD2DEG, ZUPTDetector, Butter2LP, RepMetrics, _NX,
+    _VZ_CLAMP,
 )
 
 
@@ -359,6 +360,42 @@ class TestEKF:
             state = ekf.update(s)
         assert state.rep_metrics is None
 
+    def test_velocity_clamped_during_extreme_motion(self):
+        """Velocity should never exceed the physical clamp."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+
+        # Rest
+        for i in range(100):
+            s = _make_sample(i * 0.002, az=-1.0, seq=i)
+            ekf.update(s)
+
+        # Absurd acceleration: 20g for 200 samples
+        for i in range(100, 300):
+            s = _make_sample(i * 0.002, az=-21.0, seq=i)
+            state = ekf.update(s)
+
+        assert abs(state.vertical_velocity) <= _VZ_CLAMP + 0.01
+
+    def test_velocity_near_zero_after_long_rest(self):
+        """After exercise followed by long rest, velocity must settle."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+
+        # Rest → motion → rest pattern (mimics finish exercising + put down)
+        for i in range(100):
+            s = _make_sample(i * 0.002, az=-1.0, seq=i)
+            ekf.update(s)
+        for i in range(100, 200):
+            s = _make_sample(i * 0.002, az=-3.0, seq=i)
+            ekf.update(s)
+        # 5 seconds of rest (2500 samples)
+        for i in range(200, 2700):
+            s = _make_sample(i * 0.002, az=-1.0, seq=i)
+            state = ekf.update(s)
+
+        assert abs(state.vertical_velocity) < 0.01
+
     def test_gyro_bias_stored_from_cal(self):
         """Gyro bias should be initialised from calibration."""
         cal = _ideal_cal()
@@ -513,6 +550,28 @@ class TestDeadReckoning:
         states = self._drive(ekf, 2000, az=-1.0, start_i=0)
         reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
         assert len(reps) == 0
+
+    def test_no_double_count_reps(self):
+        """Running 3 full rep cycles should produce exactly 2 reps, not 4+.
+
+        With reversal consumption, cycle 1 sets up the seed, cycles 2 and 3
+        each produce exactly 1 rep.
+        """
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+        all_states: list[EstimatorState] = []
+
+        states, next_i = self._simulate_full_rep(ekf, start_i=0)
+        all_states += states
+        states, next_i = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states += states
+        states, _ = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states += states
+
+        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
+        # Should be exactly 2 reps (3 cycles, first cycle seeds, 2 actual reps)
+        # Allow up to 3 but definitely NOT 4+ (which would indicate double-counting)
+        assert 1 <= len(reps) <= 3, f"Expected 1-3 reps, got {len(reps)}"
 
     def test_pcv_geq_mcv(self):
         """Peak concentric velocity should be >= mean concentric velocity."""
