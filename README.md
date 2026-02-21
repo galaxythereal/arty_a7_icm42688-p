@@ -15,6 +15,7 @@ A complete FPGA-based IMU streaming pipeline for the Arty A7-100T: SPI sensor in
 - **Host-side EKF** — orientation, velocity, and position estimation
 - **ZUPT** (zero-velocity updates) for drift-free rep-by-rep velocity tracking
 - **VBT app** — real-time rep detection with peak/mean velocity metrics
+- **Live dashboard** — 4-panel matplotlib visualization (accel, velocity, orientation, rep bars)
 
 ---
 
@@ -121,10 +122,13 @@ FPGA (raw packets) ──UART──► imu_driver ──► calibration ──�
 ### Quick Start
 
 ```bash
-pip3 install numpy pyserial
+pip3 install numpy pyserial matplotlib
 
 # Run VBT app (hold sensor still for ~1 s calibration, then move)
 python3 -m host.vbt
+
+# Launch real-time dashboard
+python3 -m host.dashboard
 
 # Log session to CSV
 python3 -m host.vbt --csv > session.csv
@@ -208,6 +212,7 @@ host/                    - Host-side VBT pipeline (Python)
   calibration.py       - Static bias estimation
   estimator.py         - EKF: orientation + velocity + ZUPT
   vbt.py               - VBT app: rep detection + metrics
+  dashboard.py         - Real-time 4-panel matplotlib dashboard
   tests/
     test_estimator.py  - Offline tests for the estimator
 
@@ -230,4 +235,4 @@ Makefile               - Build and simulation targets
 ---
 
 ## License
-MIT License. See LICENSE.# ICM-42688-P IMU Streaming — Arty A7-100T (Verilog)
+MIT License. See LICENSE.
