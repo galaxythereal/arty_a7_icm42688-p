@@ -1,0 +1,32 @@
+# Build artifacts
+build/*.json
+build/*.fasm
+build/*.frames
+build/*.bit
+build/*.log
+build/*.vvp
+build/*.vcd
+
+# Simulation outputs (VCD waveforms)
+*.vcd
+*.vvp
+
+# Chipdb (large binary files - generated)
+chipdb/*.bba
+chipdb/*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
