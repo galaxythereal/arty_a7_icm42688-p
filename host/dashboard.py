@@ -36,7 +36,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 
 from .calibration import calibrate
-from .estimator import IMUEstimator, EstimatorState
+from .estimator import IMUEstimator, EstimatorState, RepMetrics
 from .imu_driver import IMUSample, stream, find_port
 
 # ── Circular buffer for rolling plots ──────────────────────────────────────
@@ -69,53 +69,22 @@ class SharedState:
     def __init__(self, ring_len: int):
         self.lock = threading.Lock()
         self.accel = RingBuffer(ring_len, 3)    # ax, ay, az  world (m/s²)
-        self.velocity = RingBuffer(ring_len, 4) # vx, vy, vz, |v|
+        self.velocity = RingBuffer(ring_len, 2) # vz, |v|
         self.orient = RingBuffer(ring_len, 2)   # roll, pitch
         self.time_buf = RingBuffer(ring_len, 1) # relative time (s)
         self.speed_now = 0.0
+        self.vz_now = 0.0
         self.is_stationary = True
+        self.is_moving = False
         self.rep_count = 0
-        self.rep_peaks: list[float] = []        # peak velocity per rep
-        self.rep_means: list[float] = []        # mean velocity per rep
+        self.rep_mcv: list[float] = []           # MCV per rep
+        self.rep_pcv: list[float] = []           # PCV per rep
+        self.rep_mev: list[float] = []           # MEV per rep
         self.t0: float | None = None
         self.count = 0
         self.hz = 0.0
         self.cal_done = False
         self.cal_progress = 0.0
-
-
-# ── Rep tracker (same logic as vbt.py) ─────────────────────────────────────
-
-class _RepTracker:
-    def __init__(self):
-        self.in_rep = False
-        self.rep_count = 0
-        self.peak_speed = 0.0
-        self.speed_sum = 0.0
-        self.speed_n = 0
-        self._was_still = True
-
-    def update(self, state: EstimatorState) -> tuple[float, float] | None:
-        if state.is_stationary:
-            if self.in_rep:
-                self.in_rep = False
-                mean_v = self.speed_sum / max(self.speed_n, 1)
-                result = (self.peak_speed, mean_v)
-                self.peak_speed = 0.0
-                self.speed_sum = 0.0
-                self.speed_n = 0
-                return result
-            self._was_still = True
-        else:
-            if self._was_still and not self.in_rep:
-                self.in_rep = True
-                self.rep_count += 1
-                self._was_still = False
-            if self.in_rep:
-                self.peak_speed = max(self.peak_speed, state.speed)
-                self.speed_sum += state.speed
-                self.speed_n += 1
-        return None
 
 
 # ── IMU processing thread ──────────────────────────────────────────────────
@@ -143,7 +112,6 @@ def _imu_thread_inner(shared: SharedState, port: str, baud: int, cal_n: int) -> 
 
     cal = calibrate(cal_samples)
     ekf = IMUEstimator(cal)
-    tracker = _RepTracker()
 
     with shared.lock:
         shared.cal_done = True
@@ -152,25 +120,27 @@ def _imu_thread_inner(shared: SharedState, port: str, baud: int, cal_n: int) -> 
 
     for sample in imu:
         state = ekf.update(sample)
-
-        rep_result = tracker.update(state)
-
         t_rel = time.monotonic() - t_start
 
         with shared.lock:
             shared.count += 1
             shared.speed_now = state.speed
+            shared.vz_now = state.vertical_velocity
             shared.is_stationary = state.is_stationary
-            shared.rep_count = tracker.rep_count
+            shared.is_moving = state.is_moving
 
             shared.time_buf.append([t_rel])
             shared.accel.append(state.accel_world)
-            shared.velocity.append([*state.velocity, state.speed])
+            shared.velocity.append([state.vertical_velocity, state.speed])
             shared.orient.append([state.euler[0], state.euler[1]])
 
-            if rep_result:
-                shared.rep_peaks.append(rep_result[0])
-                shared.rep_means.append(rep_result[1])
+            # Rep completed -- record VBT metrics
+            if state.rep_metrics is not None:
+                rm = state.rep_metrics
+                shared.rep_count = rm.rep_number
+                shared.rep_mcv.append(rm.mean_concentric_velocity)
+                shared.rep_pcv.append(rm.peak_concentric_velocity)
+                shared.rep_mev.append(rm.mean_eccentric_velocity)
 
             elapsed = t_rel
             if elapsed > 0:
@@ -199,16 +169,14 @@ def _build_dashboard(shared: SharedState, window_sec: float):
     ax_acc.legend(loc="upper right", fontsize=8)
     ax_acc.grid(alpha=0.2)
 
-    # ── Panel 2: Velocity ──
+    # ── Panel 2: Vertical Velocity (VBT signal) ──
     ax_vel = fig.add_subplot(gs[0, 1])
-    ax_vel.set_title("Velocity", fontsize=11, pad=8)
+    ax_vel.set_title("Vertical Velocity (VBT)", fontsize=11, pad=8)
     ax_vel.set_ylabel("m/s")
     ax_vel.set_xlabel("time (s)")
     ax_vel.set_ylim(-2, 2)
-    line_vx, = ax_vel.plot([], [], lw=1, color="#FF6B6B", label="Vx")
-    line_vy, = ax_vel.plot([], [], lw=1, color="#51CF66", label="Vy")
-    line_vz, = ax_vel.plot([], [], lw=1, color="#339AF0", label="Vz")
-    line_spd, = ax_vel.plot([], [], lw=2, color="#FCC419", label="|V|")
+    line_vz, = ax_vel.plot([], [], lw=2, color="#339AF0", label="Vz")
+    line_spd, = ax_vel.plot([], [], lw=1, color="#FCC419", alpha=0.6, label="|V|")
     ax_vel.legend(loc="upper right", fontsize=8)
     ax_vel.grid(alpha=0.2)
 
@@ -242,10 +210,13 @@ def _build_dashboard(shared: SharedState, window_sec: float):
             vel = shared.velocity.get()
             ori = shared.orient.get()
             speed = shared.speed_now
+            vz_now = shared.vz_now
             stationary = shared.is_stationary
+            is_moving = shared.is_moving
             reps = shared.rep_count
-            peaks = list(shared.rep_peaks)
-            means = list(shared.rep_means)
+            mcv_list = list(shared.rep_mcv)
+            pcv_list = list(shared.rep_pcv)
+            mev_list = list(shared.rep_mev)
             hz = shared.hz
             cal_done = shared.cal_done
             cal_pct = shared.cal_progress
@@ -274,12 +245,10 @@ def _build_dashboard(shared: SharedState, window_sec: float):
 
         # ── Velocity ──
         if len(vel) > 0:
-            line_vx.set_data(t, vel[:, 0])
-            line_vy.set_data(t, vel[:, 1])
-            line_vz.set_data(t, vel[:, 2])
-            line_spd.set_data(t, vel[:, 3])
+            line_vz.set_data(t, vel[:, 0])
+            line_spd.set_data(t, vel[:, 1])
             ax_vel.set_xlim(t_min, t_max)
-            v_max = max(vel[:, 3].max() * 1.3, 0.5)
+            v_max = max(np.abs(vel).max() * 1.3, 0.5)
             ax_vel.set_ylim(-v_max, v_max)
 
         # ── Orientation ──
@@ -289,21 +258,22 @@ def _build_dashboard(shared: SharedState, window_sec: float):
             ax_ori.set_xlim(t_min, t_max)
 
         # ── Rep bars ──
-        if len(peaks) > 0:
+        if len(mcv_list) > 0:
             ax_rep.cla()
-            ax_rep.set_title("Rep Metrics", fontsize=11, pad=8)
+            ax_rep.set_title("VBT Rep Metrics", fontsize=11, pad=8)
             ax_rep.set_ylabel("m/s")
             ax_rep.set_xlabel("Rep #")
             ax_rep.grid(alpha=0.2, axis="y")
-            x = np.arange(1, len(peaks) + 1)
-            w = 0.35
-            ax_rep.bar(x - w/2, peaks, w, color="#FF6B6B", label="Peak", alpha=0.9)
-            ax_rep.bar(x + w/2, means, w, color="#339AF0", label="Mean", alpha=0.9)
+            x = np.arange(1, len(mcv_list) + 1)
+            w = 0.25
+            ax_rep.bar(x - w, pcv_list, w, color="#FF6B6B", label="PCV", alpha=0.9)
+            ax_rep.bar(x,     mcv_list, w, color="#339AF0", label="MCV", alpha=0.9)
+            ax_rep.bar(x + w, mev_list, w, color="#51CF66", label="MEV", alpha=0.9)
             ax_rep.set_xticks(x)
             ax_rep.legend(fontsize=8)
         else:
             ax_rep.cla()
-            ax_rep.set_title("Rep Metrics", fontsize=11, pad=8)
+            ax_rep.set_title("VBT Rep Metrics", fontsize=11, pad=8)
             ax_rep.set_ylabel("m/s")
             ax_rep.set_xlabel("Rep #")
             ax_rep.grid(alpha=0.2, axis="y")
@@ -312,10 +282,10 @@ def _build_dashboard(shared: SharedState, window_sec: float):
                         fontsize=11, color="#868E96")
 
         # ── Status ──
-        state_str = "REST" if stationary else "MOVE"
-        state_col = "#51CF66" if stationary else "#FF6B6B"
+        state_str = "MOVE" if is_moving else "REST"
+        state_col = "#FF6B6B" if is_moving else "#51CF66"
         status_text.set_text(
-            f"Speed: {speed:.3f} m/s   │   State: {state_str}   │   "
+            f"Vz: {vz_now:+.3f} m/s   │   State: {state_str}   │   "
             f"Reps: {reps}   │   {hz:.0f} Hz   │   Samples: {count}"
         )
         status_text.set_color(state_col)
