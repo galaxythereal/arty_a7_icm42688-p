@@ -2,7 +2,7 @@
 
 A complete FPGA-based IMU streaming pipeline for the Arty A7-100T: SPI sensor interface, continuous burst polling, and UART packet streaming at ~1 kHz. This repo includes a full open-source toolchain flow, unit/integration testbenches, and a Python host decoder.
 
-**Status:** 123/123 tests passing ✅
+**Status:** 123/123 RTL tests + 19/19 estimator tests passing ✅
 
 ---
 
@@ -12,6 +12,9 @@ A complete FPGA-based IMU streaming pipeline for the Arty A7-100T: SPI sensor in
 - Robust UART packetizer with fixed header/trailer and host decoder
 - Verified endianness handling (INTF_CONFIG0 bit4 = 1)
 - Clean testbench suite (unit + integration)
+- **Host-side EKF** — orientation, velocity, and position estimation
+- **ZUPT** (zero-velocity updates) for drift-free rep-by-rep velocity tracking
+- **VBT app** — real-time rep detection with peak/mean velocity metrics
 
 ---
 
@@ -104,6 +107,58 @@ Expected at rest: |accel| ≈ 1g (direction depends on board orientation), gyro 
 
 ---
 
+## Velocity-Based Training (VBT)
+
+The host-side pipeline turns raw IMU data into real-time velocity and position:
+
+```
+FPGA (raw packets) ──UART──► imu_driver ──► calibration ──► EKF estimator ──► VBT app
+                              (decode)       (bias removal)  (orientation +    (rep detect,
+                                                              velocity +       peak/mean v)
+                                                              ZUPT)
+```
+
+### Quick Start
+
+```bash
+pip3 install numpy pyserial
+
+# Run VBT app (hold sensor still for ~1 s calibration, then move)
+python3 -m host.vbt
+
+# Log session to CSV
+python3 -m host.vbt --csv > session.csv
+```
+
+### How It Works
+1. **Calibration** — collects 500 samples at rest, estimates gyro bias and gravity direction.
+2. **EKF** — fuses gyro (prediction) + accelerometer gravity reference (correction) to track orientation as a quaternion. Rotates accel into the world frame and subtracts gravity to get linear acceleration.
+3. **Velocity integration** — integrates linear acceleration for velocity and position.
+4. **ZUPT** — detects stationary phases (between reps) and resets velocity to zero, eliminating IMU drift.
+5. **Rep tracking** — each movement phase between two rest phases is a "rep", with peak and mean velocity reported.
+
+### EKF State Vector (10)
+| Index | State | Description |
+|-------|-------|-------------|
+| 0–3   | q     | Orientation quaternion (scalar-first) |
+| 4–6   | bg    | Gyro bias (°/s) |
+| 7–9   | v     | Velocity in world frame (m/s) |
+
+### Estimator Tests
+
+```bash
+python3 -m pytest host/tests/test_estimator.py -v
+```
+
+| Test Suite | Tests | Status |
+|---|---:|---|
+| Quaternion ops | 6 | ALL PASS |
+| ZUPT detector | 3 | ALL PASS |
+| Calibration | 4 | ALL PASS |
+| EKF integration | 6 | ALL PASS |
+
+---
+
 ## Simulation Suite (Icarus Verilog)
 
 ```bash
@@ -146,6 +201,15 @@ constraints/
 scripts/
   run_sim.sh           - Run all simulation testbenches
   stream_imu.py        - UART stream decoder + live metrics
+
+host/                    - Host-side VBT pipeline (Python)
+  __init__.py
+  imu_driver.py        - Packet decode from FPGA UART
+  calibration.py       - Static bias estimation
+  estimator.py         - EKF: orientation + velocity + ZUPT
+  vbt.py               - VBT app: rep detection + metrics
+  tests/
+    test_estimator.py  - Offline tests for the estimator
 
 chipdb/
   xc7a100tcsg324-1.bba - nextpnr-xilinx chip database (optional)

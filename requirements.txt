@@ -1,0 +1,3 @@
+# host/ Python dependencies
+numpy>=1.24
+pyserial>=3.5
