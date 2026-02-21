@@ -12,7 +12,7 @@ A complete FPGA-based IMU streaming pipeline for the Arty A7-100T: SPI sensor in
 - Robust UART packetizer with fixed header/trailer and host decoder
 - Verified endianness handling (INTF_CONFIG0 bit4 = 1)
 - Clean testbench suite (unit + integration)
-- **Host-side EKF** — orientation, velocity, and position estimation
+- **Host-side EKF** — 13-state tactical-grade orientation, velocity, and position estimation with SHOE ZUPT, online accel-bias tracking, and velocity decay
 - **ZUPT** (zero-velocity updates) for drift-free rep-by-rep velocity tracking
 - **VBT app** — real-time rep detection with peak/mean velocity metrics
 - **Live dashboard** — 4-panel matplotlib visualization (accel, velocity, orientation, rep bars)
@@ -135,18 +135,20 @@ python3 -m host.vbt --csv > session.csv
 ```
 
 ### How It Works
-1. **Calibration** — collects 500 samples at rest, estimates gyro bias and gravity direction.
-2. **EKF** — fuses gyro (prediction) + accelerometer gravity reference (correction) to track orientation as a quaternion. Rotates accel into the world frame and subtracts gravity to get linear acceleration.
-3. **Velocity integration** — integrates linear acceleration for velocity and position.
-4. **ZUPT** — detects stationary phases (between reps) and resets velocity to zero, eliminating IMU drift.
-5. **Rep tracking** — each movement phase between two rest phases is a "rep", with peak and mean velocity reported.
+1. **Calibration** — collects 500 samples at rest, estimates gyro bias, accel bias, and gravity direction.
+2. **13-state EKF** — fuses gyro (prediction) + accelerometer gravity reference (correction) to track orientation as a quaternion. Tracks gyro bias, accel bias, and velocity online. Rotates accel into the world frame and subtracts gravity to get linear acceleration.
+3. **Velocity integration** — integrates linear acceleration for velocity and position. Exponential decay attenuates low-frequency drift between ZUPTs.
+4. **SHOE ZUPT** — Stance Hypothesis Optimal dEtection (Skog et al.) uses variance-based test statistic over sliding window — far more robust than max-threshold. Detects stationary phases and resets velocity to zero with tight (0.001 m/s) noise.
+5. **Adaptive accel correction** — measurement noise scales quadratically with |a| deviation from 1g, smoothly de-weighting during high dynamics.
+6. **Rep tracking** — each movement phase between two rest phases is a "rep", with peak and mean velocity reported.
 
-### EKF State Vector (10)
+### EKF State Vector (13)
 | Index | State | Description |
 |-------|-------|-------------|
 | 0–3   | q     | Orientation quaternion (scalar-first) |
 | 4–6   | bg    | Gyro bias (°/s) |
-| 7–9   | v     | Velocity in world frame (m/s) |
+| 7–9   | ba    | Accel bias (g) — tracked online |
+| 10–12 | v     | Velocity in world frame (m/s) |
 
 ### Estimator Tests
 
@@ -157,9 +159,9 @@ python3 -m pytest host/tests/test_estimator.py -v
 | Test Suite | Tests | Status |
 |---|---:|---|
 | Quaternion ops | 6 | ALL PASS |
-| ZUPT detector | 3 | ALL PASS |
+| ZUPT detector (SHOE) | 4 | ALL PASS |
 | Calibration | 4 | ALL PASS |
-| EKF integration | 6 | ALL PASS |
+| EKF integration | 10 | ALL PASS |
 
 ---
 

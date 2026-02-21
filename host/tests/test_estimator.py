@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_estimator.py — Offline tests for the EKF estimator module.
+test_estimator.py — Offline tests for the tactical-grade EKF estimator.
 
 Run:  python3 -m pytest host/tests/test_estimator.py -v
 """
@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from host.imu_driver import IMUSample
 from host.calibration import CalibrationResult, calibrate
 from host.estimator import (
-    IMUEstimator, _qnorm, _qmul, _qrot, _q2dcm, _omega_matrix,
-    G_MPS2, DEG2RAD, RAD2DEG, ZUPTDetector,
+    IMUEstimator, _qnorm, _qmul, _qrot, _q2dcm, _omega_matrix, _skew,
+    G_MPS2, DEG2RAD, RAD2DEG, ZUPTDetector, _NX,
 )
 
 
@@ -92,22 +92,33 @@ class TestZUPT:
             assert z.update(1.0, 0.1) is True
 
     def test_moving_detected(self):
+        """High accel deviation should trigger non-stationary."""
         z = ZUPTDetector(window=5, accel_thresh=0.1, gyro_thresh=5.0)
-        # Fill window
+        # Fill window with motion (|a|=1.5g → deviation from 1g is 0.5)
         for _ in range(5):
-            z.update(1.0, 0.1)
-        # Now add high accel
-        for _ in range(5):
-            result = z.update(1.5, 0.1)
+            z.update(1.5, 0.1)
+        # Variance of (1.5-1)² = 0.25 > 0.1² = 0.01
+        result = z.update(1.5, 0.1)
         assert result is False
 
     def test_high_gyro_not_stationary(self):
         z = ZUPTDetector(window=5, accel_thresh=0.1, gyro_thresh=5.0)
         for _ in range(5):
             z.update(1.0, 0.1)
+        # Fill window with high gyro (mean(10²) = 100 > 5² = 25)
         for _ in range(5):
             result = z.update(1.0, 10.0)
         assert result is False
+
+    def test_shoe_single_outlier_robust(self):
+        """SHOE should be robust to a single outlier — key improvement."""
+        z = ZUPTDetector(window=10, accel_thresh=0.15, gyro_thresh=5.0)
+        # Fill with 9 perfect + 1 moderate outlier
+        for _ in range(9):
+            z.update(1.0, 0.1)
+        # One sample at 1.3g — mean((0.3²+0*9)/10) = 0.009 < 0.15² = 0.0225
+        result = z.update(1.3, 0.1)
+        assert result is True  # old max-based would have rejected this
 
 
 # ── Calibration ─────────────────────────────────────────────────────────────
@@ -226,10 +237,52 @@ class TestEKF:
         assert hasattr(state, "is_stationary")
         assert hasattr(state, "accel_world")
         assert hasattr(state, "gyro_bias")
+        assert hasattr(state, "accel_bias")
         assert state.q.shape == (4,)
         assert state.euler.shape == (3,)
         assert state.velocity.shape == (3,)
         assert state.position.shape == (3,)
+        assert state.accel_bias.shape == (3,)
+
+    def test_covariance_13x13(self):
+        """EKF should use 13×13 covariance for the extended state."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+        assert ekf.P.shape == (_NX, _NX)
+        s = _make_sample(0.0, az=-1.0)
+        ekf.update(s)
+        assert ekf.P.shape == (_NX, _NX)
+
+    def test_accel_bias_tracked(self):
+        """Accel bias should be initialised from calibration."""
+        cal = _ideal_cal()
+        cal.accel_bias = np.array([0.01, -0.02, 0.005])
+        ekf = IMUEstimator(cal)
+        np.testing.assert_allclose(ekf.ba, [0.01, -0.02, 0.005])
+
+    def test_long_stationary_drift_bounded(self):
+        """5000 samples at rest — velocity drift should stay < 5 mm/s."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+        for i in range(5000):
+            s = _make_sample(i * 0.002, az=-1.0, seq=i)
+            state = ekf.update(s)
+        assert state.speed < 0.005  # < 5 mm/s after 10 seconds at rest
+
+    def test_velocity_decay_attenuates_drift(self):
+        """Velocity decay should reduce residual velocity during motion."""
+        cal = _ideal_cal()
+        # With decay
+        ekf_d = IMUEstimator(cal, vel_decay=1.0)
+        # Without decay
+        ekf_n = IMUEstimator(cal, vel_decay=0.0)
+        # Inject small constant accel bias to cause drift
+        for i in range(200):
+            s = _make_sample(i * 0.002, ax=0.01, az=-1.0, seq=i)
+            sd = ekf_d.update(s)
+            sn = ekf_n.update(s)
+        # Decay version should have less velocity
+        assert sd.speed <= sn.speed
 
 
 if __name__ == "__main__":

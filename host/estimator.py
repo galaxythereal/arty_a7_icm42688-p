@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-estimator.py — Extended Kalman Filter for orientation, velocity, and position.
+estimator.py — Tactical-grade Extended Kalman Filter for VBT.
 
-Pipeline
---------
-1. **Orientation EKF** — fuses gyro (prediction) + accelerometer gravity
-   reference (correction) to track a rotation quaternion.
-2. **Velocity integrator** — rotates corrected accel into the world frame,
-   subtracts gravity, integrates for velocity and position.
-3. **ZUPT detector** — identifies stationary phases and resets velocity drift,
-   which is the key enabler for rep-by-rep VBT tracking with IMU-only.
+Drift-mitigation techniques (informed by 2024–2025 research):
+  • **SHOE detector** — Stance Hypothesis Optimal dEtection (Skog et al.)
+    uses variance-based test statistic instead of fragile max-threshold.
+  • **13-state EKF** — tracks accelerometer bias online so gravity
+    subtraction stays accurate over time.
+  • **Tight ZUPT** — R_zupt = 0.001² for hard velocity reset at rest.
+  • **Adaptive accel R** — measurement noise scales with |a|-deviation
+    from 1 g, smoothly de-weighting during high dynamics.
+  • **Exponential velocity decay** — gentle high-pass between ZUPTs
+    attenuates low-frequency integration drift.
 
-State vector  (10)
+State vector  (13)
     q  = [q0, q1, q2, q3]   orientation quaternion  (scalar-first)
     bg = [bgx, bgy, bgz]    gyro bias  (°/s)
+    ba = [bax, bay, baz]    accel bias (g)
     v  = [vx, vy, vz]       velocity in world frame  (m/s)
 
-The position is tracked outside the EKF (simple integration of v) because
-ZUPT already controls velocity drift, and keeping the state small keeps the
-filter fast enough for real-time on PC.
+Position is tracked outside the EKF (simple integration of v) because
+ZUPT already controls velocity drift, and keeping the state small keeps
+the filter fast enough for real-time on PC.
 """
 
 from __future__ import annotations
@@ -35,6 +38,13 @@ from .imu_driver import IMUSample
 G_MPS2 = 9.80665          # m/s²
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
+
+# ── State indices ───────────────────────────────────────────────────────────
+_SQ = slice(0, 4)     # quaternion
+_SBG = slice(4, 7)    # gyro bias
+_SBA = slice(7, 10)   # accel bias  (NEW)
+_SV = slice(10, 13)   # velocity
+_NX = 13              # total state dimension
 
 
 # ── Quaternion helpers (scalar-first: q = [w, x, y, z]) ────────────────────
@@ -88,20 +98,44 @@ def _omega_matrix(w: np.ndarray) -> np.ndarray:
     ])
 
 
-# ── ZUPT detector ──────────────────────────────────────────────────────────
+def _skew(v: np.ndarray) -> np.ndarray:
+    """3-vector → skew-symmetric matrix [v]×."""
+    return np.array([
+        [ 0,    -v[2],  v[1]],
+        [ v[2],  0,    -v[0]],
+        [-v[1],  v[0],  0   ],
+    ])
+
+
+# ── SHOE-based ZUPT detector ───────────────────────────────────────────────
 
 class ZUPTDetector:
     """
-    Zero-Velocity Update detector.
+    Zero-Velocity Update detector using the SHOE test statistic.
 
-    Declares the sensor stationary when both:
-      • |accel| is close to 1 g  (no linear acceleration)
-      • gyro magnitude is small  (no rotation)
-    over a sliding window.
+    SHOE (Stance Hypothesis Optimal dEtection) from Skog et al. (2010)
+    uses a variance-based test over a sliding window instead of a brittle
+    max-threshold.  A single outlier sample no longer vetoes the entire
+    window.
+
+    The test computes:
+      • accel component — mean squared deviation of |a| from 1 g
+      • gyro  component — mean squared gyro magnitude
+
+    Both must be below their respective thresholds² for zero-velocity.
+
+    Parameters
+    ----------
+    window : int
+        Sliding window length (samples).
+    accel_thresh : float
+        Threshold on RMS accel deviation from 1 g (g).
+    gyro_thresh : float
+        Threshold on RMS gyro magnitude (°/s).
     """
     def __init__(self, window: int = 20,
-                 accel_thresh: float = 0.08,
-                 gyro_thresh: float = 3.0):
+                 accel_thresh: float = 0.06,
+                 gyro_thresh: float = 2.5):
         self.window = window
         self.accel_thresh = accel_thresh   # g
         self.gyro_thresh  = gyro_thresh    # °/s
@@ -109,16 +143,30 @@ class ZUPTDetector:
         self._gyro_buf:  list[float] = []
 
     def update(self, accel_mag: float, gyro_mag: float) -> bool:
-        """Return True if sensor is currently stationary."""
-        self._accel_buf.append(abs(accel_mag - 1.0))
+        """
+        Return True if sensor is currently stationary.
+
+        Uses variance-based SHOE statistic over the sliding window.
+        """
+        self._accel_buf.append(accel_mag)
         self._gyro_buf.append(gyro_mag)
         if len(self._accel_buf) > self.window:
             self._accel_buf.pop(0)
             self._gyro_buf.pop(0)
         if len(self._accel_buf) < self.window:
             return True  # assume stationary during fill-up
-        a_ok = max(self._accel_buf) < self.accel_thresh
-        g_ok = max(self._gyro_buf) < self.gyro_thresh
+
+        # SHOE test: accel — mean squared deviation of |a| from 1 g
+        a_arr = np.array(self._accel_buf)
+        a_var = float(np.mean((a_arr - 1.0) ** 2))
+
+        # SHOE test: gyro — mean squared magnitude
+        g_arr = np.array(self._gyro_buf)
+        g_var = float(np.mean(g_arr ** 2))
+
+        # Both must be below threshold²
+        a_ok = a_var < self.accel_thresh ** 2
+        g_ok = g_var < self.gyro_thresh ** 2
         return a_ok and g_ok
 
 
@@ -136,11 +184,14 @@ class EstimatorState:
     speed: float           # |v|  (m/s)
     is_stationary: bool    # ZUPT active
     gyro_bias: np.ndarray  # estimated gyro bias (°/s)
+    accel_bias: np.ndarray # estimated accel bias (g)
 
 
 class IMUEstimator:
     """
-    Extended Kalman Filter for 6-DOF IMU.
+    13-state Extended Kalman Filter for tactical-grade VBT.
+
+    State: [q(4), gyro_bias(3), accel_bias(3), velocity(3)]
 
     Parameters
     ----------
@@ -154,28 +205,37 @@ class IMUEstimator:
         Accelerometer noise density  (g).
     sigma_gyro_bias : float
         Gyro bias random-walk  (°/s per √s).
+    sigma_accel_bias : float
+        Accel bias random-walk  (g per √s).
+    vel_decay : float
+        Exponential velocity decay rate (1/s).  Attenuates low-freq drift
+        between ZUPTs.  0 = disabled, 0.5–2.0 typical.
     """
 
     def __init__(self,
                  cal: CalibrationResult,
                  dt_nominal: float = 1.0 / 446.0,
-                 sigma_gyro: float = 0.5,
-                 sigma_accel: float = 0.05,
-                 sigma_gyro_bias: float = 0.001):
+                 sigma_gyro: float = 0.3,
+                 sigma_accel: float = 0.03,
+                 sigma_gyro_bias: float = 0.0005,
+                 sigma_accel_bias: float = 0.00005,
+                 vel_decay: float = 0.8):
         self.cal = cal
         self.dt_nominal = dt_nominal
+        self.vel_decay = vel_decay
 
-        # ── State: [q(4), bg(3), v(3)] = 10 ──
-        # Initialise orientation from calibration gravity direction
+        # ── State: [q(4), bg(3), ba(3), v(3)] = 13 ──
         self._init_orientation_from_gravity(cal.gravity_dir)
         self.bg = cal.gyro_bias.copy()
+        self.ba = cal.accel_bias.copy()
         self.v  = np.zeros(3)
         self.pos = np.zeros(3)
 
-        # ── Covariance (10×10) ──
+        # ── Covariance (13×13) ──
         self.P = np.diag([
             1e-4, 1e-4, 1e-4, 1e-4,       # quaternion
             1e-2, 1e-2, 1e-2,               # gyro bias  (°/s)²
+            1e-4, 1e-4, 1e-4,               # accel bias (g)²
             1e-4, 1e-4, 1e-4,               # velocity   (m/s)²
         ])
 
@@ -183,8 +243,9 @@ class IMUEstimator:
         self.Q_gyro  = (sigma_gyro * DEG2RAD) ** 2
         self.Q_accel = (sigma_accel * G_MPS2) ** 2
         self.Q_gbias = (sigma_gyro_bias * DEG2RAD) ** 2
-        self.R_accel = (sigma_accel * G_MPS2) ** 2
-        self.R_zupt  = 0.01 ** 2   # ZUPT velocity measurement noise (m/s)²
+        self.Q_abias = (sigma_accel_bias * G_MPS2) ** 2
+        self.R_accel_base = (sigma_accel * G_MPS2) ** 2
+        self.R_zupt  = 0.001 ** 2   # tight ZUPT: 1 mm/s noise (was 10 mm/s)
 
         # ── ZUPT ──
         self.zupt = ZUPTDetector()
@@ -257,12 +318,15 @@ class IMUEstimator:
         accel_raw = np.array([sample.ax, sample.ay, sample.az])   # g
 
         gyro = (gyro_raw - self.bg) * DEG2RAD     # rad/s, bias-corrected
-        accel_g = accel_raw - self.cal.accel_bias  # g, bias-corrected
+        accel_g = accel_raw - self.ba              # g, bias-corrected (tracked online)
 
-        # ── ZUPT detection ──
-        accel_mag = np.linalg.norm(accel_g)
+        # ── ZUPT detection (SHOE) ──
+        # Use calibration-corrected accel for ZUPT, NOT EKF-tracked bias,
+        # to avoid feedback loops where a drifted ba prevents ZUPT activation.
+        accel_cal = accel_raw - self.cal.accel_bias
+        accel_mag_zupt = np.linalg.norm(accel_cal)
         gyro_mag  = np.linalg.norm(gyro_raw - self.bg)
-        self.is_stationary = self.zupt.update(accel_mag, gyro_mag)
+        self.is_stationary = self.zupt.update(accel_mag_zupt, gyro_mag)
 
         # ══════════════════════════════════════════════════════════════════
         # PREDICT
@@ -281,6 +345,11 @@ class IMUEstimator:
             self._correct_zupt()
             self.pos = np.zeros(3)  # reset displacement each rest phase
 
+        # ── Velocity decay (high-pass) — attenuate low-freq drift ──
+        if not self.is_stationary and self.vel_decay > 0:
+            decay = math.exp(-self.vel_decay * dt)
+            self.v *= decay
+
         # ── Integrate position ──
         self.pos += self.v * dt
 
@@ -298,11 +367,13 @@ class IMUEstimator:
             speed=float(np.linalg.norm(self.v)),
             is_stationary=self.is_stationary,
             gyro_bias=self.bg.copy(),
+            accel_bias=self.ba.copy(),
         )
 
     # ── EKF predict ─────────────────────────────────────────────────────────
 
-    def _predict(self, gyro: np.ndarray, accel_g: np.ndarray, dt: float) -> None:
+    def _predict(self, gyro: np.ndarray, accel_g: np.ndarray,
+                 dt: float) -> None:
         """Propagate state and covariance one time step."""
         q = self.q
 
@@ -313,41 +384,36 @@ class IMUEstimator:
 
         # -- Velocity propagation --
         R = _q2dcm(self.q)
-        accel_world = R @ (accel_g * G_MPS2)      # m/s²  in world frame
-        accel_world[2] += G_MPS2                   # remove gravity  (world Z = up)
+        accel_world = R @ (accel_g * G_MPS2)      # m/s² in world frame
+        accel_world[2] += G_MPS2                   # remove gravity (Z = up)
         self.v += accel_world * dt
 
-        # -- State transition Jacobian F (10×10) --
-        F = np.eye(10)
+        # -- State transition Jacobian F (13×13) --
+        F = np.eye(_NX)
 
         # ∂q/∂q
         F[0:4, 0:4] = np.eye(4) + 0.5 * Om * dt
 
-        # ∂q/∂bg  (quaternion sensitivity to gyro bias)
+        # ∂q/∂bg (quaternion sensitivity to gyro bias)
         Xi = 0.5 * dt * np.array([
             [-q[1], -q[2], -q[3]],
             [ q[0], -q[3],  q[2]],
             [ q[3],  q[0], -q[1]],
             [-q[2],  q[1],  q[0]],
-        ]) * (-DEG2RAD)  # bg is in °/s but state uses rad/s internally
-        F[0:4, 4:7] = Xi
+        ]) * (-DEG2RAD)
+        F[_SQ, _SBG] = Xi
 
-        # ∂v/∂q  — linearised rotation effect (simplified)
-        # Use numerical perturbation or first-order skew-symmetric approx
-        a_body = accel_g * G_MPS2
-        a_skew = np.array([
-            [ 0,       -a_body[2],  a_body[1]],
-            [ a_body[2], 0,        -a_body[0]],
-            [-a_body[1], a_body[0], 0         ],
-        ])
-        F[7:10, 0:4] = np.zeros((3, 4))  # simplified: ignore ∂v/∂q coupling
-        # (the accel correction step handles this well enough)
+        # ∂v/∂ba — velocity sensitivity to accel bias
+        # v += R @ (accel_g * G) * dt, accel_g = a_raw - ba
+        # ∂v/∂ba = -R * G * dt
+        F[10:13, 7:10] = -R * G_MPS2 * dt
 
         # -- Process noise Q --
-        Q = np.zeros((10, 10))
-        Q[0:4, 0:4] = np.eye(4) * self.Q_gyro * dt**2
-        Q[4:7, 4:7] = np.eye(3) * self.Q_gbias * dt
-        Q[7:10, 7:10] = np.eye(3) * self.Q_accel * dt**2
+        Q = np.zeros((_NX, _NX))
+        Q[0:4, 0:4]   = np.eye(4) * self.Q_gyro * dt**2
+        Q[4:7, 4:7]   = np.eye(3) * self.Q_gbias * dt
+        Q[7:10, 7:10] = np.eye(3) * self.Q_abias * dt   # accel bias random walk
+        Q[10:13, 10:13] = np.eye(3) * self.Q_accel * dt**2
 
         self.P = F @ self.P @ F.T + Q
 
@@ -355,80 +421,83 @@ class IMUEstimator:
 
     def _correct_accel(self, accel_g: np.ndarray) -> None:
         """
-        Use accelerometer as a gravity reference to correct orientation.
+        Use accelerometer as a gravity reference to correct orientation
+        and accel bias.
 
         Measurement model:  h(q) = R(q)^T @ [0, 0, -1]  ≈  accel / |accel|
-        (valid only when linear acceleration is small — checked via ZUPT/mag)
         """
-        # Predicted gravity in sensor frame
         R = _q2dcm(self.q)
-        g_pred = R.T @ np.array([0.0, 0.0, -1.0])   # predicted unit-gravity
+        g_pred = R.T @ np.array([0.0, 0.0, -1.0])
 
-        # Measured gravity direction
         amag = np.linalg.norm(accel_g)
         if amag < 0.5 or amag > 1.8:
-            return  # reject: too far from 1g (high dynamics)
+            return  # reject outlier
         g_meas = accel_g / amag
 
         # Innovation
-        z = g_meas - g_pred   # (3,)
+        z = g_meas - g_pred
 
-        # Measurement Jacobian H (3×10):  ∂h/∂x
-        # Only orientation part is non-zero (3×4 block for quaternion)
-        # For efficiency, use the closed-form Jacobian of R^T @ g_world w.r.t. q
-        H = np.zeros((3, 10))
-        # Numerical Jacobian for the quaternion part
+        # ── Measurement Jacobian H (3×13) ──
+        H = np.zeros((3, _NX))
+
+        # ∂(R^T g_w)/∂q via numerical perturbation (4 cols)
         eps = 1e-5
         for i in range(4):
-            qp = self.q.copy()
-            qm = self.q.copy()
-            qp[i] += eps
-            qm[i] -= eps
+            qp = self.q.copy(); qm = self.q.copy()
+            qp[i] += eps; qm[i] -= eps
             hp = _q2dcm(_qnorm(qp)).T @ np.array([0.0, 0.0, -1.0])
             hm = _q2dcm(_qnorm(qm)).T @ np.array([0.0, 0.0, -1.0])
             H[:, i] = (hp - hm) / (2 * eps)
 
-        # Adaptive R: scale up measurement noise during motion
-        r_scale = 1.0 if self.is_stationary else 10.0
-        R_meas = np.eye(3) * self.R_accel * r_scale
+        # ∂h/∂ba — accel bias affects the measurement through accel_g
+        # g_meas = (a_raw - ba) / |a_raw - ba|
+        # first-order: ∂g_meas/∂ba ≈ -(I - g_meas g_meas^T) / amag
+        I3 = np.eye(3)
+        H[:, 7:10] = -(I3 - np.outer(g_meas, g_meas)) / amag
+
+        # ── Adaptive R: smooth quadratic scaling with |a|-deviation ──
+        a_dev = abs(amag - 1.0)
+        r_scale = 1.0 + (a_dev / 0.05) ** 2
+        r_scale = min(r_scale, 100.0)
+        R_meas = np.eye(3) * self.R_accel_base * r_scale
 
         # Kalman gain
         S = H @ self.P @ H.T + R_meas
         K = self.P @ H.T @ np.linalg.inv(S)
 
         # State update
-        dx = K @ z   # (10,)
-        self.q  = _qnorm(self.q + dx[0:4])
-        self.bg = self.bg + dx[4:7] * RAD2DEG  # convert back to °/s
-        self.v  = self.v + dx[7:10]
+        dx = K @ z
+        self.q  = _qnorm(self.q + dx[_SQ])
+        self.bg += dx[_SBG] * RAD2DEG       # convert back to °/s
+        self.ba += dx[_SBA]                  # g
+        self.v  += dx[_SV]
 
-        # Covariance update (Joseph form for numerical stability)
-        I_KH = np.eye(10) - K @ H
+        # Covariance update (Joseph form)
+        I_KH = np.eye(_NX) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R_meas @ K.T
 
     # ── EKF correct: ZUPT ──────────────────────────────────────────────────
 
     def _correct_zupt(self) -> None:
         """Apply zero-velocity update: v = 0 when stationary."""
-        # Measurement: z = [0,0,0] - v
         z = -self.v
 
-        # H: identity on velocity states (indices 7:10)
-        H = np.zeros((3, 10))
-        H[0, 7] = 1.0
-        H[1, 8] = 1.0
-        H[2, 9] = 1.0
+        H = np.zeros((3, _NX))
+        H[0, 10] = 1.0
+        H[1, 11] = 1.0
+        H[2, 12] = 1.0
 
         R_meas = np.eye(3) * self.R_zupt
         S = H @ self.P @ H.T + R_meas
         K = self.P @ H.T @ np.linalg.inv(S)
 
         dx = K @ z
-        self.q  = _qnorm(self.q + dx[0:4])
-        self.bg = self.bg + dx[4:7] * RAD2DEG
-        self.v  = self.v + dx[7:10]
+        self.q  = _qnorm(self.q + dx[_SQ])
+        self.bg += dx[_SBG] * RAD2DEG
+        self.ba += dx[_SBA]
+        self.v  += dx[_SV]
 
-        I_KH = np.eye(10) - K @ H
+        I_KH = np.eye(_NX) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R_meas @ K.T
 
     # ── Utilities ───────────────────────────────────────────────────────────
