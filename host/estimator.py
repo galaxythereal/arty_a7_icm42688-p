@@ -12,18 +12,23 @@ Architecture informed by validated VBT devices (VmaxPro, GymAware) and
     removal.  *No velocity in the EKF* -- eliminates continuous
     integration drift entirely.
 
-  * **Per-rep dead-reckoning** -- velocity is obtained by trapezoidal
-    integration of world-frame linear acceleration *only during detected
-    movement windows*.  Between reps, velocity is hard-zeroed.
+  * **Displacement-reversal rep detection** -- reps are detected by
+    finding peaks and valleys in the continuous displacement signal.
+    This works for ALL exercise types including touch-and-go reps,
+    continuous tempo sets, and exercises without true zero-velocity
+    phases (bench press, pendlay rows, etc.).
 
   * **Phase segmentation** -- each rep is split into concentric (up) and
-    eccentric (down) phases via vertical velocity zero-crossing.  Mean
+    eccentric (down) phases via displacement reversal points.  Mean
     Concentric Velocity (MCV) and Peak Concentric Velocity (PCV) are the
     gold-standard VBT metrics.
 
-  * **Per-phase linear drift correction** -- endpoint constraint forces
-    v=0 at rep boundaries, linearly distributing residual drift across
-    the movement window (standard INS technique).
+  * **Per-rep linear drift correction** -- applied between detected
+    reversal points, linearly distributing residual drift.
+
+  * **Multi-criteria rep validation** -- minimum ROM, minimum duration,
+    and minimum peak velocity thresholds reject noise, vibration, and
+    repositioning moves that are NOT actual reps.
 
   * **Butterworth low-pass on accel** -- 20 Hz 2nd-order IIR removes
     sensor noise without lagging the velocity waveform excessively.
@@ -32,8 +37,8 @@ State vector  (7)
     q  = [q0, q1, q2, q3]   orientation quaternion  (scalar-first)
     bg = [bgx, bgy, bgz]    gyro bias  (deg/s)
 
-Velocity & position are NOT part of the EKF -- they are computed per-rep
-via dead-reckoning with endpoint drift correction.
+Velocity & position are NOT part of the EKF -- they are computed via
+continuous integration with adaptive drift correction.
 """
 
 from __future__ import annotations
@@ -248,12 +253,20 @@ class IMUEstimator:
                  sigma_accel: float = 0.03,
                  sigma_gyro_bias: float = 0.0005,
                  lp_cutoff: float = 20.0,
-                 movement_accel_thresh: float = 0.4,
-                 min_movement_samples: int = 40):
+                 min_rom: float = 0.05,
+                 min_rep_duration: float = 0.25,
+                 min_peak_velocity: float = 0.08,
+                 reversal_smooth_window: int = 15,
+                 rest_drift_rate: float = 3.0):
         self.cal = cal
         self.dt_nominal = dt_nominal
-        self.movement_accel_thresh = movement_accel_thresh
-        self.min_movement_samples = min_movement_samples
+
+        # -- Rep validation thresholds --
+        self.min_rom = min_rom                       # metres
+        self.min_rep_duration = min_rep_duration      # seconds
+        self.min_peak_velocity = min_peak_velocity    # m/s
+        self.reversal_smooth_window = reversal_smooth_window
+        self.rest_drift_rate = rest_drift_rate        # velocity decay at rest (1/s)
 
         # -- Orientation state --
         self._init_orientation_from_gravity(cal.gravity_dir)
@@ -278,23 +291,34 @@ class IMUEstimator:
         fs = 1.0 / dt_nominal
         self.accel_lp = Butter2LP(lp_cutoff, fs, n_ch=3)
 
-        # -- Dead-reckoning state --
-        self._in_movement = False
-        self._movement_buf_az: list[float] = []
-        self._movement_buf_t: list[float] = []
-        self._movement_buf_aworld: list[np.ndarray] = []
-        self._rest_counter = 0
-        self._rest_threshold = 15
-
-        # -- Current sample velocity/position (for display) --
+        # -- Continuous velocity/displacement (not gated by ZUPT) --
         self.v = np.zeros(3)
         self.pos = np.zeros(3)
-        self._current_vz = 0.0
-        self._current_dz = 0.0
+        self._vz = 0.0         # vertical velocity (continuously integrated)
+        self._dz = 0.0         # vertical displacement
+        self._in_movement = False
+
+        # -- Displacement-reversal rep detector --
+        #   Reps are detected by finding peaks and valleys in the
+        #   smoothed vertical displacement signal.  A full rep is
+        #   a valley->peak->valley or peak->valley->peak cycle.
+        self._vz_buf: list[float] = []     # velocity history
+        self._t_buf: list[float] = []      # time history
+        self._az_buf: list[float] = []     # accel history
+        self._disp_buf: list[float] = []   # raw displacement history
+        self._smooth_dz_buf: list[float] = []  # smoothed displacement
+
+        # Reversal tracking:  we need 3 consecutive alternating reversals
+        # to form one full rep (e.g. valley -> peak -> valley).
+        self._reversals: list[tuple[int, int, float]] = []  # (buf_idx, type +1/-1, smooth_dz)
+        self._reversal_hysteresis = 0.015  # metres: ignore reversals < this from last
 
         # -- Rep tracking --
         self._rep_count = 0
-        self._pending_rep: Optional[RepMetrics] = None
+
+        # -- Drift correction state --
+        self._rest_samples = 0
+        self._vz_bias = 0.0    # estimated velocity bias (slow drift)
 
         # -- Bookkeeping --
         self.t_prev: float | None = None
@@ -362,9 +386,14 @@ class IMUEstimator:
         # Low-pass filter
         accel_world_filt = self.accel_lp(accel_world)
 
-        # -- PER-REP DEAD-RECKONING --
+        # -- CONTINUOUS VELOCITY INTEGRATION with adaptive drift control --
         az = accel_world_filt[2]
-        rep_metrics = self._dead_reckon(az, accel_world_filt, sample.t, dt)
+        rep_metrics = self._integrate_and_detect(az, sample.t, dt)
+
+        # Update 3D velocity/position for display
+        self.v[2] = self._vz
+        self.pos[2] = self._dz
+        self._in_movement = not self.is_stationary
 
         return EstimatorState(
             t=sample.t,
@@ -374,8 +403,8 @@ class IMUEstimator:
             position=self.pos.copy(),
             accel_world=accel_world_filt.copy(),
             speed=float(np.linalg.norm(self.v)),
-            vertical_velocity=self._current_vz,
-            vertical_displacement=self._current_dz,
+            vertical_velocity=self._vz,
+            vertical_displacement=self._dz,
             is_stationary=self.is_stationary,
             is_moving=self._in_movement,
             gyro_bias=self.bg.copy(),
@@ -383,148 +412,245 @@ class IMUEstimator:
             rep_metrics=rep_metrics,
         )
 
-    # -- Dead-reckoning with per-rep drift correction --------------------------
+    # -- Continuous integration + displacement-reversal rep detection -----------
 
-    def _dead_reckon(self, az: float, accel_world: np.ndarray,
-                     t: float, dt: float) -> Optional[RepMetrics]:
+    def _integrate_and_detect(self, az: float, t: float,
+                              dt: float) -> Optional[RepMetrics]:
         """
-        Per-rep dead-reckoning.
+        Continuously integrate acceleration -> velocity -> displacement.
+        Detect reps via displacement reversals (peaks/valleys).
 
-        Accumulates world-frame vertical acceleration during movement,
-        then at end of rep applies trapezoidal integration with
-        linear drift correction (endpoint constraint: v_start = v_end = 0).
+        This replaces the old ZUPT-gated dead-reckoning and works for:
+        - Touch-and-go reps (no rest between reps)
+        - Continuous tempo sets
+        - All exercise types (squat, bench, deadlift, rows, etc.)
+
+        Drift control:
+        - At rest (ZUPT): exponential decay toward zero
+        - During motion: velocity bias subtracted
+
+        Rep detection:
+        - Smooth displacement with moving-average window
+        - Detect peaks (+1) and valleys (-1) with hysteresis
+        - A full rep = 3 consecutive alternating reversals forming a
+          concentric + eccentric cycle (or vice-versa)
         """
         rep_metrics = None
 
+        # -- Drift control --
         if self.is_stationary:
-            if self._in_movement:
-                self._rest_counter += 1
-                self._movement_buf_az.append(az)
-                self._movement_buf_t.append(t)
-                self._movement_buf_aworld.append(accel_world.copy())
-
-                if self._rest_counter >= self._rest_threshold:
-                    trim = self._rest_threshold
-                    buf_az = self._movement_buf_az[:-trim] if trim > 0 else self._movement_buf_az
-                    buf_t  = self._movement_buf_t[:-trim] if trim > 0 else self._movement_buf_t
-                    buf_aw = self._movement_buf_aworld[:-trim] if trim > 0 else self._movement_buf_aworld
-
-                    if len(buf_az) >= self.min_movement_samples:
-                        rep_metrics = self._process_rep(buf_az, buf_t, buf_aw)
-
-                    self._in_movement = False
-                    self._movement_buf_az.clear()
-                    self._movement_buf_t.clear()
-                    self._movement_buf_aworld.clear()
-                    self._rest_counter = 0
-                    self.v = np.zeros(3)
-                    self.pos = np.zeros(3)
-                    self._current_vz = 0.0
-                    self._current_dz = 0.0
-            else:
-                self.v = np.zeros(3)
-                self.pos = np.zeros(3)
-                self._current_vz = 0.0
-                self._current_dz = 0.0
-                self._rest_counter = 0
+            self._rest_samples += 1
+            decay = math.exp(-self.rest_drift_rate * dt)
+            self._vz *= decay
+            alpha = min(0.02, 1.0 / max(self._rest_samples, 1))
+            self._vz_bias = (1.0 - alpha) * self._vz_bias + alpha * self._vz
+            if abs(self._vz) < 0.002:
+                self._vz = 0.0
+            if self._rest_samples > 100:
+                self._dz *= decay
         else:
-            self._rest_counter = 0
-            if not self._in_movement:
-                self._in_movement = True
-                self._movement_buf_az.clear()
-                self._movement_buf_t.clear()
-                self._movement_buf_aworld.clear()
+            self._rest_samples = 0
+            self._vz += (az - self._vz_bias * 0.5) * dt
 
-            self._movement_buf_az.append(az)
-            self._movement_buf_t.append(t)
-            self._movement_buf_aworld.append(accel_world.copy())
+        self._dz += self._vz * dt
 
-            # Live (uncorrected) velocity for display
-            self._current_vz += az * dt
-            self._current_dz += self._current_vz * dt
-            self.v[2] = self._current_vz
-            self.pos[2] = self._current_dz
+        # -- Append to buffers --
+        self._vz_buf.append(self._vz)
+        self._t_buf.append(t)
+        self._az_buf.append(az)
+        self._disp_buf.append(self._dz)
+
+        # Smoothed displacement for peak/valley detection
+        w = self.reversal_smooth_window
+        if len(self._disp_buf) >= w:
+            smooth_dz = sum(self._disp_buf[-w:]) / w
+        else:
+            smooth_dz = self._dz
+        self._smooth_dz_buf.append(smooth_dz)
+
+        # -- Detect displacement reversals with hysteresis --
+        n = len(self._smooth_dz_buf)
+        look_back = w // 2 + 1
+        if n < look_back + 2:
+            return None
+
+        # Examine the point 'look_back' samples ago (causal delay)
+        idx = n - 1 - look_back
+        if idx < 1:
+            return None
+
+        # Use 5-point neighbourhood for robust peak/valley detection
+        half_nb = min(3, idx, n - 1 - idx)
+        if half_nb < 1:
+            return None
+
+        centre = self._smooth_dz_buf[idx]
+        left_max = max(self._smooth_dz_buf[idx - half_nb:idx])
+        left_min = min(self._smooth_dz_buf[idx - half_nb:idx])
+        right_max = max(self._smooth_dz_buf[idx + 1:idx + 1 + half_nb])
+        right_min = min(self._smooth_dz_buf[idx + 1:idx + 1 + half_nb])
+
+        is_peak = centre >= left_max and centre >= right_max
+        is_valley = centre <= left_min and centre <= right_min
+
+        if not (is_peak or is_valley):
+            return None
+
+        reversal_type = 1 if is_peak else -1
+
+        # Hysteresis: ignore reversal if too close in displacement to the last
+        if self._reversals:
+            last_rev = self._reversals[-1]
+            # Must be opposite type
+            if reversal_type == last_rev[1]:
+                # Same type: update if this one is more extreme
+                if (reversal_type == 1 and centre > last_rev[2]) or \
+                   (reversal_type == -1 and centre < last_rev[2]):
+                    self._reversals[-1] = (idx, reversal_type, centre)
+                return None
+            # Must exceed hysteresis threshold
+            if abs(centre - last_rev[2]) < self._reversal_hysteresis:
+                return None
+
+        self._reversals.append((idx, reversal_type, centre))
+
+        # -- Check for a full rep (3 reversals = 2 phases = 1 rep) --
+        if len(self._reversals) >= 3:
+            r0 = self._reversals[-3]  # first reversal
+            r1 = self._reversals[-2]  # middle reversal (turnaround)
+            r2 = self._reversals[-1]  # end reversal
+
+            # r0 and r2 should be same type, r1 opposite
+            if r0[1] == r2[1] and r0[1] != r1[1]:
+                rep_metrics = self._process_full_rep(r0, r1, r2)
+
+        # -- Memory management: trim old buffers --
+        max_buf = 5000
+        if len(self._disp_buf) > max_buf:
+            trim = max_buf // 2
+            self._disp_buf = self._disp_buf[trim:]
+            self._vz_buf = self._vz_buf[trim:]
+            self._t_buf = self._t_buf[trim:]
+            self._az_buf = self._az_buf[trim:]
+            self._smooth_dz_buf = self._smooth_dz_buf[trim:]
+            # Adjust reversal indices
+            self._reversals = [
+                (max(0, ri - trim), rt, rv)
+                for ri, rt, rv in self._reversals
+                if ri >= trim
+            ]
 
         return rep_metrics
 
-    def _process_rep(self, buf_az: list[float], buf_t: list[float],
-                     buf_aw: list[np.ndarray]) -> RepMetrics:
+    def _process_phase(self, start_idx: int, end_idx: int
+                       ) -> tuple[float, float, float, float]:
         """
-        Process a completed movement window into VBT rep metrics.
+        Compute velocity metrics for a single phase (concentric or eccentric).
 
-        Uses trapezoidal integration with linear drift correction.
+        Returns (mean_v, peak_v, rom, duration).
+        Uses re-integrated accel with linear drift correction for accuracy.
         """
-        self._rep_count += 1
-        n = len(buf_az)
-        az_arr = np.array(buf_az)
-        t_arr  = np.array(buf_t)
+        seg_t = self._t_buf[start_idx:end_idx + 1]
+        seg_az = self._az_buf[start_idx:end_idx + 1]
+        seg_dz = self._disp_buf[start_idx:end_idx + 1]
 
-        # -- Compute dt array --
+        if len(seg_t) < 3:
+            return 0.0, 0.0, 0.0, 0.0
+
+        t_arr = np.array(seg_t)
+        az_arr = np.array(seg_az)
+        n = len(t_arr)
         dt_arr = np.diff(t_arr)
-        if len(dt_arr) == 0:
-            dt_arr = np.array([self.dt_nominal])
+        t_span = t_arr[-1] - t_arr[0]
+        if t_span <= 0:
+            return 0.0, 0.0, 0.0, 0.0
 
-        # -- Trapezoidal integration: accel -> velocity --
+        # Re-integrate accel -> velocity within this phase
         vz = np.zeros(n)
         for i in range(1, n):
-            vz[i] = vz[i-1] + 0.5 * (az_arr[i-1] + az_arr[i]) * dt_arr[i-1]
+            vz[i] = vz[i - 1] + 0.5 * (az_arr[i-1] + az_arr[i]) * dt_arr[i-1]
 
-        # -- Linear drift correction --
-        # Endpoint constraint: v should be 0 at both ends
-        t_span = t_arr[-1] - t_arr[0]
-        drift_rate = vz[-1] / t_span if t_span > 0 else 0.0
+        # Linear drift correction (endpoint constraint)
+        drift_rate = vz[-1] / t_span
         t_rel = t_arr - t_arr[0]
-        vz_corrected = vz - drift_rate * t_rel
+        vz -= drift_rate * t_rel
 
-        # -- Trapezoidal integration: velocity -> displacement --
+        # Displacement from re-integrated velocity
         dz = np.zeros(n)
         for i in range(1, n):
-            dz[i] = dz[i-1] + 0.5 * (vz_corrected[i-1] + vz_corrected[i]) * dt_arr[i-1]
+            dz[i] = dz[i-1] + 0.5 * (vz[i-1] + vz[i]) * dt_arr[i-1]
 
-        # -- Phase segmentation --
-        max_disp = dz.max()
-        min_disp = dz.min()
+        speeds = np.abs(vz)
+        mean_v = float(np.mean(speeds))
+        peak_v = float(np.max(speeds))
+        rom = abs(dz[-1] - dz[0])
+        if rom < 0.005:  # fallback to raw displacement
+            rom = abs(seg_dz[-1] - seg_dz[0])
 
-        if abs(max_disp) >= abs(min_disp):
-            con_mask = vz_corrected > 0
-            ecc_mask = vz_corrected < 0
+        return mean_v, peak_v, rom, t_span
+
+    def _process_full_rep(
+            self,
+            r0: tuple[int, int, float],
+            r1: tuple[int, int, float],
+            r2: tuple[int, int, float]
+    ) -> Optional[RepMetrics]:
+        """
+        Process a full rep cycle from 3 reversal points.
+
+        r0, r1, r2 = (buffer_index, type, smooth_dz)
+        type: +1 = peak (top), -1 = valley (bottom)
+
+        Two phases:
+          Phase A: r0 -> r1
+          Phase B: r1 -> r2
+
+        One of these is concentric (valley->peak), the other eccentric
+        (peak->valley).  We compute metrics for each phase and combine
+        them into one RepMetrics.
+        """
+        idx0, type0, _ = r0
+        idx1, type1, _ = r1
+        idx2, type2, _ = r2
+
+        if idx1 <= idx0 + 3 or idx2 <= idx1 + 3:
+            return None
+
+        # Compute metrics for each phase
+        mA, pA, romA, durA = self._process_phase(idx0, idx1)
+        mB, pB, romB, durB = self._process_phase(idx1, idx2)
+
+        total_rom = max(romA, romB)
+        total_dur = durA + durB
+
+        # Validate the whole rep
+        if total_rom < self.min_rom:
+            return None
+        if total_dur < self.min_rep_duration:
+            return None
+        if max(pA, pB) < self.min_peak_velocity:
+            return None
+
+        # Determine which phase is concentric, which is eccentric
+        # valley(-1) -> peak(+1) = concentric (upward)
+        # peak(+1) -> valley(-1) = eccentric (downward)
+        if type0 == -1 and type1 == 1:
+            # Phase A = concentric, Phase B = eccentric
+            mcv, pcv, con_rom, con_dur = mA, pA, romA, durA
+            mev, pev, ecc_rom, ecc_dur = mB, pB, romB, durB
+        elif type0 == 1 and type1 == -1:
+            # Phase A = eccentric, Phase B = concentric
+            mev, pev, ecc_rom, ecc_dur = mA, pA, romA, durA
+            mcv, pcv, con_rom, con_dur = mB, pB, romB, durB
         else:
-            con_mask = vz_corrected < 0
-            ecc_mask = vz_corrected > 0
+            return None  # shouldn't happen
 
-        # -- Concentric metrics --
-        con_speeds = np.abs(vz_corrected[con_mask]) if con_mask.any() else np.array([0.0])
-        mcv = float(np.mean(con_speeds)) if len(con_speeds) > 0 else 0.0
-        pcv = float(np.max(con_speeds)) if len(con_speeds) > 0 else 0.0
+        self._rep_count += 1
 
-        con_indices = np.where(con_mask)[0]
-        if len(con_indices) > 1:
-            con_rom = abs(dz[con_indices[-1]] - dz[con_indices[0]])
-            con_dur = t_arr[con_indices[-1]] - t_arr[con_indices[0]]
-        else:
-            con_rom = 0.0
-            con_dur = 0.0
+        overall_mean = (mA * durA + mB * durB) / total_dur if total_dur > 0 else 0.0
+        overall_peak = max(pA, pB)
 
-        # -- Eccentric metrics --
-        ecc_speeds = np.abs(vz_corrected[ecc_mask]) if ecc_mask.any() else np.array([0.0])
-        mev = float(np.mean(ecc_speeds)) if len(ecc_speeds) > 0 else 0.0
-        pev = float(np.max(ecc_speeds)) if len(ecc_speeds) > 0 else 0.0
-
-        ecc_indices = np.where(ecc_mask)[0]
-        if len(ecc_indices) > 1:
-            ecc_rom = abs(dz[ecc_indices[-1]] - dz[ecc_indices[0]])
-            ecc_dur = t_arr[ecc_indices[-1]] - t_arr[ecc_indices[0]]
-        else:
-            ecc_rom = 0.0
-            ecc_dur = 0.0
-
-        # -- Overall metrics --
-        total_rom = abs(max_disp - min_disp)
-        rep_dur = t_arr[-1] - t_arr[0] if n > 1 else 0.0
-        mean_v = float(np.mean(np.abs(vz_corrected)))
-        peak_v = float(np.max(np.abs(vz_corrected)))
-
-        self._pending_rep = RepMetrics(
+        return RepMetrics(
             rep_number=self._rep_count,
             mean_concentric_velocity=mcv,
             peak_concentric_velocity=pcv,
@@ -535,11 +661,10 @@ class IMUEstimator:
             total_rom=total_rom,
             concentric_duration=con_dur,
             eccentric_duration=ecc_dur,
-            rep_duration=rep_dur,
-            mean_velocity=mean_v,
-            peak_velocity=peak_v,
+            rep_duration=total_dur,
+            mean_velocity=overall_mean,
+            peak_velocity=overall_peak,
         )
-        return self._pending_rep
 
     # -- Orientation-only EKF predict ------------------------------------------
 

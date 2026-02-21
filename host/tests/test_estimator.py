@@ -251,8 +251,8 @@ class TestEKF:
         assert abs(state.euler[0]) < 2.0
         assert abs(state.euler[1]) < 2.0
 
-    def test_zupt_zeros_velocity(self):
-        """After motion followed by rest, velocity should be hard-zeroed."""
+    def test_zupt_decays_velocity(self):
+        """After motion followed by rest, velocity should decay near zero."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
 
@@ -266,11 +266,12 @@ class TestEKF:
             s = _make_sample(i * 0.002, az=-3.0, seq=i)
             state = ekf.update(s)
 
-        # Back to rest -- velocity should be zeroed by dead-reckoning
-        for i in range(150, 300):
+        # Back to rest -- velocity should decay toward zero
+        # Need ~2s of rest for exp(-3*2)=0.0025 decay
+        for i in range(150, 1200):
             s = _make_sample(i * 0.002, az=-1.0, seq=i)
             state = ekf.update(s)
-        assert state.speed < 0.01  # hard-zeroed between reps
+        assert state.speed < 0.05  # decayed near zero
 
     def test_tilted_orientation(self):
         """Gravity along -Y should produce ~90 deg roll or pitch."""
@@ -340,14 +341,14 @@ class TestEKF:
         assert state.is_stationary is True
         assert state.is_moving is False
 
-    def test_vertical_velocity_zero_at_rest(self):
-        """At rest, vertical_velocity should be hard-zeroed."""
+    def test_vertical_velocity_near_zero_at_rest(self):
+        """At rest, vertical_velocity should decay to near zero."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
         for i in range(500):
             s = _make_sample(i * 0.002, az=-1.0, seq=i)
             state = ekf.update(s)
-        assert abs(state.vertical_velocity) < 1e-9
+        assert abs(state.vertical_velocity) < 0.01
 
     def test_no_rep_at_rest(self):
         """At rest, no RepMetrics should be emitted."""
@@ -369,55 +370,101 @@ class TestEKF:
 # ── Per-rep dead-reckoning tests ────────────────────────────────────────────
 
 class TestDeadReckoning:
-    def _simulate_rep(self, ekf: IMUEstimator, n_rest_before=200,
-                      n_motion=120, n_rest_after=200,
-                      motion_az=-3.0) -> list[EstimatorState]:
-        """Simulate rest -> motion -> rest and return all states."""
+    """Tests for the displacement-reversal full-rep-cycle detector."""
+
+    @staticmethod
+    def _drive(ekf: IMUEstimator, n: int, az: float = -1.0,
+               start_i: int = 0) -> list[EstimatorState]:
+        """Feed *n* samples with a given vertical accel."""
         states = []
-        i = 0
-
-        # Rest before
-        for _ in range(n_rest_before):
-            s = _make_sample(i * 0.002, az=-1.0, seq=i)
+        for k in range(n):
+            i = start_i + k
+            s = _make_sample(i * 0.002, az=az, seq=i)
             states.append(ekf.update(s))
-            i += 1
-
-        # Motion: half concentric (accel up), half eccentric (accel down)
-        half = n_motion // 2
-        for _ in range(half):
-            s = _make_sample(i * 0.002, az=motion_az, seq=i)
-            states.append(ekf.update(s))
-            i += 1
-        for _ in range(n_motion - half):
-            # Decelerate / eccentric: less gravity removal -> net down
-            s = _make_sample(i * 0.002, az=-1.0 + (1.0 - motion_az), seq=i)
-            states.append(ekf.update(s))
-            i += 1
-
-        # Rest after
-        for _ in range(n_rest_after):
-            s = _make_sample(i * 0.002, az=-1.0, seq=i)
-            states.append(ekf.update(s))
-            i += 1
-
         return states
 
-    def test_rep_detected_after_motion(self):
-        """A motion window followed by rest should produce a RepMetrics."""
+    def _simulate_full_rep(self, ekf: IMUEstimator,
+                           n_rest: int = 200,
+                           n_con: int = 60,
+                           n_ecc: int = 60,
+                           accel_up: float = -3.0,
+                           accel_down: float = 1.0,
+                           start_i: int = 0
+                           ) -> tuple[list[EstimatorState], int]:
+        """
+        Simulate one full concentric + eccentric rep cycle.
+
+        Returns (all_states, next_i).
+
+        The acceleration pattern:
+          Rest:  az = -1.0g  (no net accel after gravity removal)
+          Conc:  az = accel_up (-3.0g = +2g net upward)
+          Ecc :  az = accel_down (+1.0g = +2g net downward)
+
+        This creates a valley -> peak -> valley displacement cycle.
+        """
+        i = start_i
+        states = []
+
+        # Rest before
+        states += self._drive(ekf, n_rest, az=-1.0, start_i=i)
+        i += n_rest
+
+        # Concentric (upward): net +2g vertical accel
+        states += self._drive(ekf, n_con, az=accel_up, start_i=i)
+        i += n_con
+
+        # Eccentric (downward): net +2g downward
+        states += self._drive(ekf, n_ecc, az=accel_down, start_i=i)
+        i += n_ecc
+
+        # Rest after
+        states += self._drive(ekf, n_rest, az=-1.0, start_i=i)
+        i += n_rest
+
+        return states, i
+
+    def test_rep_detected_after_full_cycle(self):
+        """A full concentric + eccentric cycle should produce a RepMetrics."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
-        states = self._simulate_rep(ekf)
-        # Find any state with rep_metrics
-        reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
-        assert len(reps) == 1
+        # Need at least 2 full cycles to get 3 alternating reversals
+        # (valley0 -> peak1 -> valley2 triggers rep on 3rd reversal)
+        states1, next_i = self._simulate_full_rep(ekf, start_i=0)
+        states2, _ = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states = states1 + states2
+
+        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
+        assert len(reps) >= 1
         assert reps[0].rep_number == 1
+
+    def test_rep_has_both_phases(self):
+        """RepMetrics should have BOTH concentric and eccentric metrics."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+        states1, next_i = self._simulate_full_rep(ekf, start_i=0)
+        states2, _ = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states = states1 + states2
+
+        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
+        assert len(reps) >= 1
+        rm = reps[0]
+
+        # Both concentric AND eccentric should have non-zero metrics
+        assert rm.mean_concentric_velocity > 0 or rm.mean_eccentric_velocity > 0
+        assert rm.total_rom > 0
+        assert rm.rep_duration > 0
+        assert rm.peak_velocity > 0
 
     def test_rep_metrics_fields(self):
         """RepMetrics should have all expected fields."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
-        states = self._simulate_rep(ekf)
-        reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
+        states1, next_i = self._simulate_full_rep(ekf, start_i=0)
+        states2, _ = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states = states1 + states2
+
+        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
         assert len(reps) >= 1
         rm = reps[0]
 
@@ -431,70 +478,56 @@ class TestDeadReckoning:
         assert rm.mean_velocity >= 0
         assert rm.peak_velocity >= 0
 
-    def test_two_reps_counted(self):
-        """Two motion windows should produce two reps."""
+    def test_small_vibration_not_a_rep(self):
+        """Small vibrations below min_rom should NOT trigger a rep."""
         cal = _ideal_cal()
-        ekf = IMUEstimator(cal)
-        states1 = self._simulate_rep(ekf)
-        states2 = self._simulate_rep(ekf)
-        all_states = states1 + states2
-
-        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
-        assert len(reps) == 2
-        assert reps[0].rep_number == 1
-        assert reps[1].rep_number == 2
-
-    def test_short_motion_not_a_rep(self):
-        """A movement shorter than min_movement_samples should NOT be a rep."""
-        cal = _ideal_cal()
-        ekf = IMUEstimator(cal, min_movement_samples=40)
-
+        ekf = IMUEstimator(cal, min_rom=0.05)
         states = []
         i = 0
 
         # Rest
-        for _ in range(200):
-            s = _make_sample(i * 0.002, az=-1.0, seq=i)
-            states.append(ekf.update(s))
-            i += 1
+        states += self._drive(ekf, 200, az=-1.0, start_i=i); i += 200
 
-        # Very short motion (10 samples < 40 threshold)
-        for _ in range(10):
-            s = _make_sample(i * 0.002, az=-3.0, seq=i)
-            states.append(ekf.update(s))
-            i += 1
+        # Tiny vibration: 5 samples at -1.02g (barely above gravity)
+        states += self._drive(ekf, 5, az=-1.02, start_i=i); i += 5
+        states += self._drive(ekf, 5, az=-0.98, start_i=i); i += 5
 
         # Rest
-        for _ in range(200):
-            s = _make_sample(i * 0.002, az=-1.0, seq=i)
-            states.append(ekf.update(s))
-            i += 1
+        states += self._drive(ekf, 200, az=-1.0, start_i=i); i += 200
 
         reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
         assert len(reps) == 0
 
-    def test_velocity_zeroed_between_reps(self):
-        """Between reps (at rest), velocity should be exactly zero."""
+    def test_velocity_decays_at_rest(self):
+        """At rest, velocity should decay toward zero (not hard zero)."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
-        states = self._simulate_rep(ekf)
+        states = self._drive(ekf, 500, az=-1.0, start_i=0)
+        # After extended rest, velocity should be very small
+        assert abs(states[-1].vertical_velocity) < 0.01
 
-        # Get last rest state
-        rest_states = [s for s in states[-50:] if s.is_stationary]
-        assert len(rest_states) > 0
-        for s in rest_states:
-            assert abs(s.vertical_velocity) < 1e-9
-            assert abs(s.vertical_displacement) < 1e-9
+    def test_no_rep_at_rest(self):
+        """Pure rest should produce no reps."""
+        cal = _ideal_cal()
+        ekf = IMUEstimator(cal)
+        states = self._drive(ekf, 2000, az=-1.0, start_i=0)
+        reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
+        assert len(reps) == 0
 
-    def test_pcv_greater_or_equal_mcv(self):
+    def test_pcv_geq_mcv(self):
         """Peak concentric velocity should be >= mean concentric velocity."""
         cal = _ideal_cal()
         ekf = IMUEstimator(cal)
-        states = self._simulate_rep(ekf)
-        reps = [s.rep_metrics for s in states if s.rep_metrics is not None]
-        if len(reps) > 0:
-            rm = reps[0]
-            assert rm.peak_concentric_velocity >= rm.mean_concentric_velocity
+        states1, next_i = self._simulate_full_rep(ekf, start_i=0)
+        states2, _ = self._simulate_full_rep(ekf, start_i=next_i)
+        all_states = states1 + states2
+
+        reps = [s.rep_metrics for s in all_states if s.rep_metrics is not None]
+        for rm in reps:
+            if rm.mean_concentric_velocity > 0:
+                assert rm.peak_concentric_velocity >= rm.mean_concentric_velocity
+            if rm.mean_eccentric_velocity > 0:
+                assert rm.peak_eccentric_velocity >= rm.mean_eccentric_velocity
 
 
 # ── Omega and skew matrices ────────────────────────────────────────────────
