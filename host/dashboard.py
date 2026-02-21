@@ -121,6 +121,15 @@ class _RepTracker:
 # ── IMU processing thread ──────────────────────────────────────────────────
 
 def _imu_thread(shared: SharedState, port: str, baud: int, cal_n: int) -> None:
+    try:
+        _imu_thread_inner(shared, port, baud, cal_n)
+    except Exception as e:
+        import traceback
+        print(f"\n  [ERROR] IMU thread stopped: {e}", file=sys.stderr)
+        traceback.print_exc()
+
+
+def _imu_thread_inner(shared: SharedState, port: str, baud: int, cal_n: int) -> None:
     imu = stream(port, baud)
 
     # ── Calibration ──
@@ -222,7 +231,7 @@ def _build_dashboard(shared: SharedState, window_sec: float):
     ax_rep.grid(alpha=0.2, axis="y")
 
     # ── Status bar ──
-    status_text = fig.text(0.5, 0.97, "Calibrating …", ha="center", fontsize=12,
+    status_text = fig.text(0.5, 0.97, "Calibrating...", ha="center", fontsize=12,
                            color="#FCC419", fontweight="bold")
 
     # ── Animation update ──
@@ -243,7 +252,7 @@ def _build_dashboard(shared: SharedState, window_sec: float):
             count = shared.count
 
         if not cal_done:
-            status_text.set_text(f"⏳  Calibrating … {cal_pct*100:.0f}%  —  hold sensor still")
+            status_text.set_text(f"[CAL]  Calibrating ... {cal_pct*100:.0f}%  --  hold sensor still")
             status_text.set_color("#FCC419")
             return []
 
@@ -298,7 +307,7 @@ def _build_dashboard(shared: SharedState, window_sec: float):
             ax_rep.set_ylabel("m/s")
             ax_rep.set_xlabel("Rep #")
             ax_rep.grid(alpha=0.2, axis="y")
-            ax_rep.text(0.5, 0.5, "Waiting for first rep …",
+            ax_rep.text(0.5, 0.5, "Waiting for first rep...",
                         ha="center", va="center", transform=ax_rep.transAxes,
                         fontsize=11, color="#868E96")
 

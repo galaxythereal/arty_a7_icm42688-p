@@ -88,10 +88,23 @@ def stream(port: Optional[str] = None,
     buf = bytearray()
     seq = 0
 
+    retries = 0
+    max_retries = 5
+
     try:
         while True:
-            waiting = ser.in_waiting
-            chunk = ser.read(max(waiting, 1))
+            try:
+                waiting = ser.in_waiting
+                chunk = ser.read(max(waiting, 1))
+            except (serial.SerialException, OSError) as e:
+                retries += 1
+                if retries > max_retries:
+                    raise RuntimeError(
+                        f"Serial port {port} disconnected after {max_retries} retries: {e}"
+                    ) from e
+                time.sleep(0.1)
+                continue
+            retries = 0   # reset on successful read
             if not chunk:
                 continue
             buf.extend(chunk)
